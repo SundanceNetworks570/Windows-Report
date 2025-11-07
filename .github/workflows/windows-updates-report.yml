@@ -2,7 +2,7 @@ name: Build Windows Updates HTML
 
 on:
   schedule:
-    - cron: '0 14 * * 2'  # Every Tuesday 14:00 UTC (~9:00 AM Eastern)
+    - cron: '0 14 * * 2'  # Every Tuesday 14:00 UTC (~9:00 AM Eastern during Standard Time)
   workflow_dispatch:
 
 permissions:
