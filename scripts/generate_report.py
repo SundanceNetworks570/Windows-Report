@@ -5,20 +5,15 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-# --- Configuration -----------------------------------------------------------
-# Primary (working) paths are the /windows/... variants.
+# Working "update history" pages are under /windows/...
 PRIMARY_TARGETS = [
-    # Windows 11 update history (24H2/25H2)
     "https://support.microsoft.com/windows/windows-11-update-history-31ad4770-4f3f-4a2c-97d8-4ab6e5c0bf14",
-    # Windows 10, version 22H2 update history
     "https://support.microsoft.com/windows/windows-10-update-history-3c3d33fa-2d33-96ff-a489-faf6f78b86dd",
-    # Windows Server 2022 update history
     "https://support.microsoft.com/windows/windows-server-2022-update-history-9f96d82e-9a1f-4f43-9be2-491e2d91f66b",
-    # Windows Server 2019 update history
     "https://support.microsoft.com/windows/windows-server-2019-update-history-8c40f96a-391d-4ab9-9f9d-1986fd0e0a58",
 ]
 
-# Fallbacks (older style). The resolver will try these if a primary 404s.
+# Fallbacks (older /topic/ pages) if a primary 404s.
 FALLBACK_TARGETS = [
     "https://support.microsoft.com/en-us/topic/windows-11-update-history-31ad4770-4f3f-4a2c-97d8-4ab6e5c0bf14",
     "https://support.microsoft.com/en-us/topic/windows-10-update-history-3c3d33fa-2d33-96ff-a489-faf6f78b86dd",
@@ -32,7 +27,6 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# --- Helpers -----------------------------------------------------------------
 def robust_get(url):
     r = requests.get(url, headers=HEADERS, timeout=45, allow_redirects=True)
     if r.status_code == 404:
@@ -41,12 +35,11 @@ def robust_get(url):
     return r
 
 def resolve_page(url):
-    """Try primary URL, then try mapped fallback if we hit 404."""
+    """Try the /windows/... URL; if 404, try its mapped /topic/... fallback."""
     try:
         return robust_get(url)
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
-            # try mapped fallback if available
             try:
                 idx = PRIMARY_TARGETS.index(url)
                 fb = FALLBACK_TARGETS[idx]
@@ -55,7 +48,7 @@ def resolve_page(url):
                 pass
         raise
 
-def guess_os_from_title(t):
+def guess_os_from_title(t: str) -> str:
     t = t or ""
     if "Windows 11" in t: return "Windows 11"
     if "Windows 10" in t: return "Windows 10 22H2"
@@ -63,32 +56,44 @@ def guess_os_from_title(t):
     if "Windows Server 2019" in t: return "Windows Server 2019"
     return "Windows"
 
-def parse_kb_items(page_url):
-    """Find KB links on an update-history page."""
+def parse_kb_items(page_url: str):
+    """Collect KB links from an update-history page."""
     try:
         r = resolve_page(page_url)
     except Exception:
         return []
     soup = BeautifulSoup(r.text, "html.parser")
     items = []
-    for a in soup.select('a[href*="/topic/"][href*="kb"], a[href*="/help/KB"], a[href*="/help/"]'):
+
+    # KBs often appear as links to /help/KBxxxxxxx or /topic/...kbxxxxxxx
+    selectors = [
+        'a[href*="/help/KB"]',   # /help/KB1234567
+        'a[href*="/help/"]',     # /help/1234567
+        'a[href*="/topic/"][href*="kb"]',
+    ]
+    for a in soup.select(", ".join(selectors)):
         href = a.get("href", "")
         if not href:
             continue
         link = urljoin(page_url, href)
         title = a.get_text(strip=True)
-        kb_match = re.search(r'KB\d+', title) or re.search(r'KB\d+', link, re.I)
+        kb_match = re.search(r'KB\d+', title, re.I) or re.search(r'KB\d+', link, re.I)
         if not kb_match:
             continue
-        items.append({"title": title, "link": link, "kb": kb_match.group(0).upper()})
+        items.append({
+            "title": title,
+            "link": link,
+            "kb": kb_match.group(0).upper(),
+        })
     return items
 
 def fetch_kb_details(item):
-    """Open a KB page; pull date, description, known issues."""
+    """Open the KB page and extract date, description, known issues."""
     try:
         r = robust_get(item["link"])
     except Exception:
         return None
+
     soup = BeautifulSoup(r.text, "html.parser")
 
     # Date (published/updated)
@@ -99,12 +104,11 @@ def fetch_kb_details(item):
             m = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}', el.get_text())
             if m:
                 date_text = m.group(0); break
-    # Fallback: search whole page
     if not date_text:
         m = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}', soup.get_text())
         if m: date_text = m.group(0)
 
-    # Description: first meaningful paragraph
+    # Description
     desc = ""
     h1 = soup.select_one('h1')
     if h1:
@@ -114,12 +118,12 @@ def fetch_kb_details(item):
         p = soup.find('p')
         if p: desc = p.get_text(strip=True)
 
-    # Known issues: scan heading “Known issues”
+    # Known issues list
     known = []
     for h in soup.find_all(re.compile('^h[1-6]$')):
         if 'known issues' in h.get_text(strip=True).lower():
-            for sib in h.find_all_next(['ul','ol','p'], limit=6):
-                if sib.name in ('ul','ol'):
+            for sib in h.find_all_next(['ul', 'ol', 'p'], limit=6):
+                if sib.name in ('ul', 'ol'):
                     for li in sib.find_all('li'):
                         t = ' '.join(li.get_text(' ', strip=True).split())
                         if t: known.append(t)
@@ -178,16 +182,16 @@ def main():
 
     # Emit HTML + JSON
     os.makedirs("docs", exist_ok=True)
-    with open("scripts/templates/report_template.html","r",encoding="utf-8") as f:
+    with open("scripts/templates/report_template.html", "r", encoding="utf-8") as f:
         tpl = f.read()
     html_out = tpl.replace(
         "{{data_json}}", json.dumps(records, ensure_ascii=False)
     ).replace(
         "{{generated_on}}", datetime.utcnow().strftime("%B %d, %Y %H:%M UTC")
     )
-    with open("docs/windows-updates.html","w",encoding="utf-8") as f:
+    with open("docs/windows-updates.html", "w", encoding="utf-8") as f:
         f.write(html_out)
-    with open("docs/windows-updates.json","w",encoding="utf-8") as f:
+    with open("docs/windows-updates.json", "w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
     print(f"Wrote {len(records)} records")
 
