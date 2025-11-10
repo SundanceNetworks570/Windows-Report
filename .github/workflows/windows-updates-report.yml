@@ -1,321 +1,63 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+name: Update Windows Updates Report
 
-"""
-Builds Windows update HTML from official Microsoft 'update history' pages.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * *" # runs daily at 10:00 UTC
 
-- Fetches Windows 11, Windows 10 22H2, Windows Server 2022, Windows Server 2019
-- Parses KB numbers, titles, and release dates
-- Keeps items from last N days (default 30)
-- Writes a single `index.html` at repo root
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-If Microsoft changes the "topic" GUIDs again, just update the URLS mapping below.
-"""
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-from __future__ import annotations
-import re
-import time
-import html
-import json
-import sys
-from typing import Dict, List, Tuple
-from datetime import datetime, timedelta, timezone
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
 
-import requests
-from bs4 import BeautifulSoup
+      - name: Generate Windows Updates HTML
+        run: |
+          python scripts/generate_report.py
 
-# -----------------------------
-# Config
-# -----------------------------
+      - name: Commit and push changes
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html || echo "No index.html found"
+          git commit -m "Update Windows Updates HTML report [auto]" || echo "No changes to commit"
+          git push
 
-DAYS_BACK = 30  # show items released within the last N days
-OUTPUT_FILE = "index.html"
+      - name: Upload artifact (for manual download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-updates-html
+          path: index.html
 
-# Verified working Microsoft Support "topic" URLs (Nov 2025).
-# If you get HTTP 404 again in the future, update the GUIDs here.
-URLS: Dict[str, str] = {
-    "Windows 11": "https://support.microsoft.com/en-us/topic/windows-11-update-history-204a3c9a-fd7d-4f3c-943a-0d77b2a95ad9",
-    "Windows 10 22H2": "https://support.microsoft.com/en-us/topic/windows-10-update-history-33a9f41b-5bb6-4c7d-ada0-b5f1b6a3b1a7",
-    "Windows Server 2022": "https://support.microsoft.com/en-us/topic/windows-server-2022-update-history-9580de3b-8d02-4d06-b78b-0e3d839e32cd",
-    "Windows Server 2019": "https://support.microsoft.com/en-us/topic/windows-server-2019-update-history-8450c17c-6f6d-4f9b-9f43-5a1938b1f52f",
-}
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
 
-# “Known issues” quick links per product (Release Health)
-KNOWN_ISSUES_LINKS: Dict[str, str] = {
-    "Windows 11": "https://aka.ms/WindowsReleaseHealth",
-    "Windows 10 22H2": "https://aka.ms/WindowsReleaseHealth",
-    "Windows Server 2022": "https://aka.ms/WindowsReleaseHealth",
-    "Windows Server 2019": "https://aka.ms/WindowsReleaseHealth",
-}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
+      - name: Upload to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
 
-KB_RE = re.compile(r"\bKB\d{7,8}\b", re.IGNORECASE)
-# Dates like: Nov 12, 2025   |   October 31, 2025
-MONTHS = "|".join(
-    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Sept", "Oct", "Nov", "Dec",
-     "January", "February", "March", "April", "June", "July", "August", "September", "October", "November", "December"]
-)
-DATE_RE = re.compile(rf"\b({MONTHS})\s+\d{{1,2}},\s+\d{{4}}\b", re.IGNORECASE)
-
-
-# -----------------------------
-# Utilities
-# -----------------------------
-
-def log(msg: str) -> None:
-    sys.stdout.write(msg + "\n")
-    sys.stdout.flush()
-
-
-def http_get(url: str, *, retries: int = 4, backoff: float = 0.8) -> requests.Response:
-    """GET with simple retry/backoff and helpful errors."""
-    last_exc = None
-    for attempt in range(1, retries + 1):
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=30)
-            if resp.status_code == 200:
-                return resp
-            # 4xx/5xx
-            log(f"  ⚠ HTTP {resp.status_code} fetching {url}")
-        except requests.RequestException as e:
-            last_exc = e
-            log(f"  ⚠ Network error fetching {url}: {e}")
-        time.sleep(backoff * attempt)
-    if last_exc:
-        raise last_exc
-    raise RuntimeError(f"Failed to GET {url}")
-
-
-def parse_date_any(s: str) -> datetime | None:
-    """Parse 'Nov 05, 2025' etc to UTC date (midnight)."""
-    try:
-        dt = datetime.strptime(s.strip(), "%b %d, %Y")
-        return dt.replace(tzinfo=timezone.utc)
-    except ValueError:
-        pass
-    try:
-        dt = datetime.strptime(s.strip(), "%B %d, %Y")
-        return dt.replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
-
-
-def normalize_ws(s: str) -> str:
-    return " ".join(s.split())
-
-
-# -----------------------------
-# Parsing Microsoft pages
-# -----------------------------
-
-def extract_updates(html_text: str) -> List[Tuple[str, str, datetime]]:
-    """
-    Heuristic parser:
-      - Find sections/blocks that contain both KB and a plausible date
-      - Title/description: the line/heading containing the KB (fallback: neighboring text)
-    Returns list of (kb, title, released_dt_utc)
-    """
-    soup = BeautifulSoup(html_text, "html.parser")
-
-    # Grab text blocks that usually hold entries (headings, list items, paragraphs)
-    candidates = soup.find_all(["h1", "h2", "h3", "h4", "li", "p", "div", "section", "article"])
-    items: List[Tuple[str, str, datetime]] = []
-
-    for node in candidates:
-        text = normalize_ws(node.get_text(" ", strip=True))
-        if not text:
-            continue
-
-        kbs = KB_RE.findall(text)
-        if not kbs:
-            continue
-
-        # Try to find a date in same or nearby text
-        date_match = DATE_RE.search(text)
-        if not date_match:
-            # look at previous sibling or parent
-            prev = node.find_previous(string=DATE_RE)
-            if prev:
-                date_match = DATE_RE.search(prev)
-
-        if not date_match:
-            continue
-
-        date_str = date_match.group(0)
-        dt = parse_date_any(date_str)
-        if not dt:
-            continue
-
-        title = text
-        # Keep it readable; title often contains too much. Take first sentence/line with KB present.
-        first_line = next((ln for ln in title.split(". ") if "KB" in ln), title)
-        title = normalize_ws(first_line.strip().rstrip("."))
-
-        # Add all KBs found in this block with same date/title
-        for kb in kbs:
-            kb_upper = kb.upper()
-            items.append((kb_upper, title, dt))
-
-    # Deduplicate: (kb, date) as key; keep earliest title seen
-    seen = {}
-    out: List[Tuple[str, str, datetime]] = []
-    for kb, title, dt in items:
-        key = (kb, dt.date())
-        if key in seen:
-            continue
-        seen[key] = True
-        out.append((kb, title, dt))
-
-    return out
-
-
-# -----------------------------
-# HTML generation
-# -----------------------------
-
-def render_html(rows: List[Dict[str, str]]) -> str:
-    """Render final HTML page."""
-    page_title = "Windows Updates (Last 30 Days)"
-    css = """
-    body { background:#0f172a; color:#e2e8f0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
-    a { color:#93c5fd; text-decoration:none; }
-    a:hover { text-decoration:underline; }
-    .wrap { max-width:1200px; margin:40px auto; padding:0 16px; }
-    h1 { font-size:28px; margin:0 0 18px 0; }
-    .controls { display:flex; gap:10px; margin:10px 0 20px 0; align-items:center; }
-    table { width:100%; border-collapse:collapse; }
-    th, td { padding:12px 10px; border-bottom:1px solid rgba(148,163,184,0.2); vertical-align:top; }
-    th { text-align:left; color:#cbd5e1; font-weight:600; font-size:13px; letter-spacing:.03em; text-transform:uppercase; }
-    td { font-size:14px; }
-    .kbdot { color:#94a3b8; }
-    .source-badge { background:#0b1220; border:1px solid #334155; padding:4px 8px; border-radius:999px; font-size:12px; }
-    .muted { color:#94a3b8; }
-    .small { font-size:12px; color:#94a3b8; }
-    """
-    header = f"""<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>{html.escape(page_title)}</title>
-<style>{css}</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>{html.escape(page_title)}</h1>
-  <div class="small">Source: Microsoft Support “Update history” pages. Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</div>
-  <div class="controls"></div>
-  <table>
-    <thead>
-      <tr>
-        <th style="width:16%">Product</th>
-        <th style="width:14%">KB(s)</th>
-        <th>Title / Description</th>
-        <th style="width:14%">Release Date</th>
-        <th style="width:12%">Known Issues</th>
-        <th style="width:10%">Source</th>
-      </tr>
-    </thead>
-    <tbody>
-"""
-    body_parts: List[str] = []
-    for r in rows:
-        prod = html.escape(r["product"])
-        kb = r["kb_html"]        # already escaped with anchors
-        title = html.escape(r["title"])
-        date = html.escape(r["release_date"])
-        issues = r["known_html"] # already escaped with anchor
-        source = r["source_html"]# already escaped with anchor
-
-        body_parts.append(
-            f"<tr>"
-            f"<td>{prod}</td>"
-            f"<td>{kb}</td>"
-            f"<td>{title}</td>"
-            f"<td class='muted'>{date}</td>"
-            f"<td>{issues}</td>"
-            f"<td>{source}</td>"
-            f"</tr>"
-        )
-
-    footer = """
-    </tbody>
-  </table>
-</div>
-</body></html>
-"""
-    return header + "\n".join(body_parts) + footer
-
-
-# -----------------------------
-# Main pipeline
-# -----------------------------
-
-def main() -> int:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS_BACK)
-    all_rows: List[Dict[str, str]] = []
-
-    for product, url in URLS.items():
-        log(f"Processing {product} ...")
-        try:
-            resp = http_get(url)
-        except Exception as e:
-            log(f"  ⚠ Failed to fetch {url}: {e}")
-            continue
-
-        updates = extract_updates(resp.text)
-        if not updates:
-            log("  ⚠ No updates parsed on page (structure may have changed).")
-            continue
-
-        # Sort newest first
-        updates.sort(key=lambda t: t[2], reverse=True)
-
-        kept = 0
-        for kb, title, dt in updates:
-            if dt < cutoff:
-                continue
-
-            # KB anchor to Microsoft Update Catalog (best place to land)
-            kb_num = kb.upper().replace("KB", "")
-            catalog_link = f"https://www.catalog.update.microsoft.com/Search.aspx?q={kb}"
-            kb_html = f"<a href='{html.escape(catalog_link)}' target='_blank' rel='noopener'>{html.escape(kb)}</a>"
-
-            known_link = KNOWN_ISSUES_LINKS.get(product, "https://aka.ms/WindowsReleaseHealth")
-            known_html = f"<a href='{html.escape(known_link)}' target='_blank' rel='noopener'>Known issues</a>"
-
-            source_html = f"<a class='source-badge' href='{html.escape(url)}' target='_blank' rel='noopener'>MS Support</a>"
-
-            all_rows.append({
-                "product": product,
-                "kb_html": kb_html,
-                "title": title if title else "—",
-                "release_date": dt.strftime("%b %d, %Y"),
-                "known_html": known_html,
-                "source_html": source_html,
-                "sort_dt": dt.isoformat(),
-            })
-            kept += 1
-
-        log(f"  ✓ kept {kept} updates (<= {DAYS_BACK} days)")
-
-    # Sort globally by date desc
-    all_rows.sort(key=lambda r: r["sort_dt"], reverse=True)
-
-    html_out = render_html(all_rows)
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(html_out)
-
-    log(f"Wrote {OUTPUT_FILE}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
