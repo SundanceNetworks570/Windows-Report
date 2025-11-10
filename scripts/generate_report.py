@@ -13,7 +13,7 @@ import re, html
 
 # ---------------- Configuration ---------------- #
 
-DAYS_BACK = 30
+DAYS_BACK = 90
 OUTPUT_FILE = "index.html"
 
 # Official release health RSS feeds
