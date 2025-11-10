@@ -1,57 +1,30 @@
-<!doctype html>
-<html lang="en">
-<meta charset="utf-8">
+<!doctype html><html lang=en><meta charset=utf-8>
 <title>Windows Updates (Last 90 Days)</title>
 <style>
-    :root{color-scheme:dark}
-    body{font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b1220;color:#e9eef7}
-    header{padding:28px 20px;border-bottom:1px solid #1b2743}
-    h1{margin:0 0 8px 0;font-size:22px}
-    .meta{opacity:.75;font-size:13px}
-    .wrap{max-width:1200px;margin:0 auto}
-    .controls{display:flex;gap:10px;margin:16px 0}
-    .btn{padding:8px 12px;border-radius:8px;background:#1a2a44;border:1px solid #243b63;color:#dfe8ff;text-decoration:none;font-size:13px}
-    .btn:hover{background:#21365b}
-    table{width:100%;border-collapse:collapse;margin:12px 0 40px 0}
-    th,td{padding:12px;border-bottom:1px solid #1b2743;vertical-align:top;font-size:14px}
-    th{opacity:.9;text-align:left}
-    .kb{display:inline-block;background:#0f2244;border:1px solid #25447a;color:#b8d1ff;border-radius:6px;padding:2px 8px;margin:2px 6px 2px 0;font-size:12px}
-    .src{display:inline-block;background:#0d1c33;border:1px solid #223b6e;color:#a9c5ff;border-radius:999px;padding:4px 10px;font-size:12px;text-decoration:none}
-    .src:hover{background:#12274d}
-    .known{display:inline-block;background:#38210a;border:1px solid #6a3c12;color:#ffd9a8;border-radius:999px;padding:4px 10px;font-size:12px;text-decoration:none}
-    .known:hover{background:#4a2b0f}
-    input[type="search"]{width:360px;background:#09132a;border:1px solid #20355e;border-radius:8px;padding:8px 10px;color:#e9eef7}
-    </style>
-<body>
-<header>
-  <div class="wrap">
-    <h1>Windows Updates (Last 90 Days)</h1>
-    <div class="meta">Showing 0 updates • Generated 2025-11-10 16:45 UTC</div>
-    <div class="controls">
-      <input id="q" type="search" placeholder="Search KB, OS, or description..." oninput="filterRows()">
-      <a class="btn" href="#" onclick="window.print();return false;">Print / PDF</a>
-    </div>
-  </div>
-</header>
-<div class="wrap">
-<table>
-  <thead>
-    <tr><th>OS</th><th>Description</th><th>KB(s)</th><th>Known Issues</th><th>Release Date</th><th>Source</th></tr>
-  </thead>
-  <tbody>
-    <tr><td colspan="6">No updates found in the last 30 days.</td></tr>
-  </tbody>
-</table>
-</div>
+:root{color-scheme:dark}
+body{font-family:Segoe UI,Roboto,Arial,sans-serif;background:#0b1220;color:#e9eef7;margin:0}
+header{padding:24px 16px;border-bottom:1px solid #1b2743}
+.wrap{max-width:1200px;margin:0 auto}
+h1{margin:0 0 8px 0;font-size:22px}
+.meta{opacity:.75;font-size:13px}
+input{width:340px;background:#09132a;border:1px solid #20355e;border-radius:8px;padding:8px;color:#e9eef7}
+table{width:100%;border-collapse:collapse;margin-top:20px}
+th,td{padding:10px;border-bottom:1px solid #1b2743;font-size:14px;text-align:left;vertical-align:top}
+.kb{background:#0f2244;border:1px solid #25447a;padding:2px 6px;margin:2px 4px;border-radius:6px;font-size:12px}
+.src{background:#12274d;border:1px solid #2a4a7d;padding:4px 8px;border-radius:8px;color:#b8d1ff;text-decoration:none;font-size:12px}
+</style>
+<body><header><div class=wrap>
+<h1>Windows Updates (Last 90 Days)</h1>
+<div class=meta>Generated 2025-11-10 16:56 UTC — 0 updates</div>
+<input id=q oninput="f()" placeholder="Search KB, OS, description…">
+</div></header><div class=wrap>
+<table><thead><tr><th>OS</th><th>Description</th><th>KB(s)</th><th>Release Date</th><th>Source</th></tr></thead><tbody>
+<tr><td colspan=5>No updates found.</td></tr></tbody></table></div>
 <script>
-    function filterRows(){
-      const q = document.getElementById('q').value.toLowerCase();
-      const rows = document.querySelectorAll('tbody tr');
-      rows.forEach(tr=>{
-        const t = tr.textContent.toLowerCase();
-        tr.style.display = (t.indexOf(q) !== -1) ? '' : 'none';
-      });
-    }
-    </script>
-</body>
-</html>
+function f(){
+ const q=document.getElementById('q').value.toLowerCase();
+ document.querySelectorAll('tbody tr').forEach(tr=>{
+  tr.style.display=tr.textContent.toLowerCase().includes(q)?'':'none';
+ });
+}
+</script></body></html>
