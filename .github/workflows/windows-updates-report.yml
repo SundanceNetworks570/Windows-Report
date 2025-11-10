@@ -1,31 +1,30 @@
 name: Update Windows Updates Report
 
-# IMPORTANT: allow this workflow's GITHUB_TOKEN to push commits
-permissions:
-  contents: write   # <— this is the key fix
-  pages: write
-  id-token: write
-
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 10 * * *" # daily @ 10:00 UTC
+    - cron: "0 10 * * *" # daily 10:00 UTC
+
+permissions:
+  contents: write        # 👈 allows git push with GITHUB_TOKEN
+  pages: write
+  id-token: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0             # ensure we have history for commit/push
-          ref: ${{ github.ref }}     # stay on the correct branch
+          # if you later add a PAT secret named PUBLISH_TOKEN, uncomment the next line:
+          # token: ${{ secrets.PUBLISH_TOKEN }}
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
@@ -33,61 +32,54 @@ jobs:
           pip install requests beautifulsoup4
 
       - name: Generate Windows Updates HTML
+        id: generate
         run: |
           python scripts/generate_report.py
 
-      - name: Configure git author
+      - name: Commit and push changes (only if modified)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLISH_TOKEN: ${{ secrets.PUBLISH_TOKEN }} # optional PAT fallback
         run: |
+          set -euo pipefail
+
+          # If you added a PAT secret, re-point origin to use it (fallback to GITHUB_TOKEN).
+          if [ -n "${PUBLISH_TOKEN:-}" ]; then
+            git remote set-url origin "https://x-access-token:${PUBLISH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          else
+            git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          fi
+
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Stage changes
-        run: |
-          # Add the generated report if present
-          if [ -f index.html ]; then
-            git add index.html
-          fi
+          git add index.html || true
 
-      - name: Commit if changed
-        id: commit
-        run: |
-          set -e
           if git diff --cached --quiet; then
-            echo "changes=false" >> "$GITHUB_OUTPUT"
-            echo "No staged changes to commit."
+            echo "No changes to commit."
           else
             git commit -m "Update Windows Updates HTML report [auto]"
-            echo "changes=true" >> "$GITHUB_OUTPUT"
+            git push
           fi
 
-      - name: Push if committed
-        if: steps.commit.outputs.changes == 'true'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # make sure the remote uses the token
-          git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
-          git push
-
-      - name: Upload artifact (manual download)
+      - name: Upload artifact (optional download)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-updates-html
           path: index.html
-          if-no-files-found: ignore
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Upload Pages artifact
+      - name: Upload to GitHub Pages
         uses: actions/upload-pages-artifact@v3
         with:
           path: .
 
       - name: Deploy to GitHub Pages
-        id: deployment
         uses: actions/deploy-pages@v4
