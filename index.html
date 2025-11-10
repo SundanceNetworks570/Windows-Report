@@ -1,44 +1,69 @@
 <!doctype html>
 <html lang="en">
-<head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Windows Updates (Last 30 Days)</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  body {
-    background:#0f172a; color:#e2e8f0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial;
-    margin: 0; padding: 32px;
-  }
-  h1 { margin: 0 0 16px 0; font-size: 22px; }
-  .toolbar {
-    display:flex; gap:8px; align-items:center; margin: 10px 0 24px 0; flex-wrap: wrap;
-  }
-  table {
-    width: 100%; border-collapse: collapse; background:#0b1220; border:1px solid #23304a;
-  }
-  th, td { padding: 10px 12px; border-bottom: 1px solid #1e293b; vertical-align: top; }
-  th { background:#0b162a; text-align:left; color:#aebbd3; font-weight:600; }
-  a, a:visited { color:#7dd3fc; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  .muted { color:#94a3b8; font-size: 12px; margin-top: 6px; }
-</style>
-</head>
+    :root{color-scheme:dark}
+    body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b1220;color:#e9eef7}
+    header{padding:28px 20px;border-bottom:1px solid #1b2743}
+    h1{margin:0 0 8px 0;font-size:22px}
+    .meta{opacity:.75;font-size:13px}
+    .wrap{max-width:1200px;margin:0 auto}
+    .controls{display:flex;gap:10px;margin:16px 0}
+    .btn{padding:8px 12px;border-radius:8px;background:#1a2a44;border:1px solid #243b63;color:#dfe8ff;text-decoration:none;font-size:13px}
+    .btn:hover{background:#21365b}
+    table{width:100%;border-collapse:collapse;margin:12px 0 40px 0}
+    th,td{padding:12px;border-bottom:1px solid #1b2743;vertical-align:top;font-size:14px}
+    th{opacity:.9;text-align:left}
+    .kb{display:inline-block;background:#0f2244;border:1px solid #25447a;color:#b8d1ff;border-radius:6px;padding:2px 8px;margin:2px 6px 2px 0;font-size:12px}
+    .pill{display:inline-block;background:#15253f;border:1px solid #25447a;color:#cfe0ff;border-radius:999px;padding:4px 10px;font-size:12px}
+    .src{display:inline-block;background:#0d1c33;border:1px solid #223b6e;color:#a9c5ff;border-radius:999px;padding:4px 10px;font-size:12px;text-decoration:none}
+    .src:hover{background:#12274d}
+    .known{display:inline-block;background:#38210a;border:1px solid #6a3c12;color:#ffd9a8;border-radius:999px;padding:4px 10px;font-size:12px;text-decoration:none}
+    .known:hover{background:#4a2b0f}
+    .muted{opacity:.7}
+    input[type="search"]{width:360px;background:#09132a;border:1px solid #20355e;border-radius:8px;padding:8px 10px;color:#e9eef7}
+    select{background:#09132a;border:1px solid #20355e;border-radius:8px;padding:8px 10px;color:#e9eef7}
+    </style>
 <body>
-  <h1>Windows Updates (Last 30 Days)</h1>
-  <div class="muted">Source: Microsoft Support “Update history” pages (stable topic URLs).</div>
-  <table>
-    <thead>
-      <tr>
-        <th>Product</th>
-        <th>KB(s)</th>
-        <th>Title</th>
-        <th>Release date</th>
-        <th>Source</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr><td colspan='5' style='text-align:center;color:#aaa;'>No updates found.</td></tr>
-    </tbody>
-  </table>
+  <header>
+    <div class="wrap">
+      <h1>Windows Updates (Last 30 Days)</h1>
+      <div class="meta">Showing 0 updates • Generated 2025-11-10 16:03 UTC</div>
+      <div class="controls">
+        <input id="q" type="search" placeholder="Search CVE, KB, description, OS…" oninput="filterRows()">
+        <a class="btn" href="#" onclick="window.print();return false;">Print / PDF</a>
+      </div>
+    </div>
+  </header>
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>OS</th>
+          <th>Description</th>
+          <th>KB(s)</th>
+          <th>Known Issues</th>
+          <th>Release Date</th>
+          <th>Source</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td colspan="6" class="muted">No updates in the selected window.</td></tr>
+      </tbody>
+    </table>
+    <div class="muted">Sources: Microsoft Update Catalog RSS; Windows Release Health landing pages.</div>
+  </div>
+<script>
+    function filterRows(){
+      const q = document.getElementById('q').value.toLowerCase();
+      const rows = document.querySelectorAll('tbody tr');
+      rows.forEach(tr=>{
+        const t = tr.textContent.toLowerCase();
+        tr.style.display = (t.indexOf(q) !== -1) ? '' : 'none';
+      });
+    }
+    </script>
 </body>
 </html>
