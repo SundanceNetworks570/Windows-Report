@@ -1,21 +1,31 @@
 name: Update Windows Updates Report
 
+# IMPORTANT: allow this workflow's GITHUB_TOKEN to push commits
+permissions:
+  contents: write   # <— this is the key fix
+  pages: write
+  id-token: write
+
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 10 * * *" # runs daily at 10:00 UTC
+    - cron: "0 10 * * *" # daily @ 10:00 UTC
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0             # ensure we have history for commit/push
+          ref: ${{ github.ref }}     # stay on the correct branch
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
@@ -26,34 +36,54 @@ jobs:
         run: |
           python scripts/generate_report.py
 
-      - name: Commit and push changes
+      - name: Configure git author
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Stage changes
+        run: |
+          # Add the generated report if present
+          if [ -f index.html ]; then
+            git add index.html
+          fi
+
+      - name: Commit if changed
+        id: commit
         run: |
           set -e
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add index.html || echo "No index.html found"
-          git commit -m "Update Windows Updates HTML report [auto]" || echo "No changes to commit"
+          if git diff --cached --quiet; then
+            echo "changes=false" >> "$GITHUB_OUTPUT"
+            echo "No staged changes to commit."
+          else
+            git commit -m "Update Windows Updates HTML report [auto]"
+            echo "changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push if committed
+        if: steps.commit.outputs.changes == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # make sure the remote uses the token
+          git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
           git push
 
-      - name: Upload artifact (for manual download)
+      - name: Upload artifact (manual download)
         uses: actions/upload-artifact@v4
         with:
           name: windows-updates-html
           path: index.html
+          if-no-files-found: ignore
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Upload to GitHub Pages
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: .
