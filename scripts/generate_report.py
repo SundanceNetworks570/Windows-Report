@@ -2,285 +2,291 @@
 # -*- coding: utf-8 -*-
 
 """
-Generate Windows Updates HTML report.
+Stable Windows Updates report generator.
 
-Fixes:
-- Microsoft changed Support "update history" URLs (previous ones now 404).
-- This script uses the current, stable topic pages and a resilient parser.
-- No 3rd-party libs required (stdlib only).
+- Uses Microsoft Update Catalog RSS feeds (reliable + include KB numbers)
+- Writes a single index.html at repo root
+- Adds OS-specific "Release Health" known-issues links (stable landing pages)
+- Filters to last 30 days
+- Retries with backoff, browser UA, and timeouts
 
-Output:
-- ./index.html  (overwritten each run)
-
-Columns:
-- Product
-- KB(s) found (comma separated)
-- Title (first line of item/section)
-- Release date (best-effort extraction)
-- Source (clickable)
-
-Notes:
-- We are intentionally conservative about parsing; if we cannot
-  confidently extract a piece of data, we leave it blank rather than fail.
+This avoids the fragile support.microsoft.com "topic" pages that 404.
 """
 
-from __future__ import annotations
-
-import html
-import json
-import os
-import re
 import sys
+import re
 import time
+import math
+import html
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any
+import xml.etree.ElementTree as ET
 import urllib.request
-import urllib.error
-from html.parser import HTMLParser
-from typing import Dict, List, Optional, Tuple
 
+# -----------------------------
+# Configuration
+# -----------------------------
 
-# ===== 1) CURRENT WORKING MICROSOFT TOPIC PAGES (as of Nov 2025) =====
-# These replace the old URLs that returned 404.
-URLS: Dict[str, str] = {
-    "Windows 11": "https://support.microsoft.com/topic/windows-11-update-history-204a3c9a-fd7d-4f3c-943a-0d77b2a95ad9",
-    "Windows 10 22H2": "https://support.microsoft.com/topic/windows-10-update-history-33a9f41b-5bb6-4c7d-ada0-b5f1b6a3b1a7",
-    "Windows Server 2022": "https://support.microsoft.com/topic/windows-server-2022-update-history-9580de3b-8d02-4d06-b78b-0e3d839e32cd",
-    "Windows Server 2019": "https://support.microsoft.com/topic/windows-server-2019-update-history-8450c17c-6f6d-4f9b-9f43-5a1938b1f52f",
-}
+# Microsoft Update Catalog RSS (use HTTP — this endpoint is plain RSS and very stable)
+FEEDS = [
+    # Display Name, RSS URL, Release Health landing (for Known Issues button)
+    ("Windows 11", "http://www.catalog.update.microsoft.com/Feed.aspx?Product=Windows%2011",
+     "https://learn.microsoft.com/windows/release-health/"),
+    ("Windows 10", "http://www.catalog.update.microsoft.com/Feed.aspx?Product=Windows%2010",
+     "https://learn.microsoft.com/windows/release-health/"),
+    ("Windows Server 2022", "http://www.catalog.update.microsoft.com/Feed.aspx?Product=Windows%20Server%202022",
+     "https://learn.microsoft.com/windows/release-health/"),
+    ("Windows Server 2019", "http://www.catalog.update.microsoft.com/Feed.aspx?Product=Windows%20Server%202019",
+     "https://learn.microsoft.com/windows/release-health/"),
+    ("Windows Server 2016", "http://www.catalog.update.microsoft.com/Feed.aspx?Product=Windows%20Server%202016",
+     "https://learn.microsoft.com/windows/release-health/"),
+]
 
+DAYS_BACK = 30
+OUTPUT_FILE = "index.html"
 
-# ===== 2) UTILS =====
-
-KB_RE = re.compile(r"\bKB\d{6,8}\b", re.IGNORECASE)
-# Dates on MS pages vary; we accept formats like "Nov 06, 2025", "October 8, 2025"
-DATE_RE = re.compile(
-    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b",
-    re.IGNORECASE,
+# Browser-y UA so catalog doesn’t act funny
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
-HEADLINE_RE = re.compile(r"^\s*(.*?)\s*(?:–|-|—|:)\s*", re.UNICODE)  # first phrase before dash/colon
+# -----------------------------
+# Utilities
+# -----------------------------
 
-
-def http_get(url: str, timeout: int = 30, retries: int = 3, backoff: float = 1.5) -> bytes:
-    """
-    Simple GET with retries, returns raw bytes or raises on final failure.
-    """
-    last_err: Optional[Exception] = None
-    for attempt in range(1, retries + 1):
+def http_get(url: str, timeout: int = 20, attempts: int = 5, base_delay: float = 0.75) -> bytes:
+    """GET with retry/backoff and browser UA."""
+    last = None
+    for i in range(attempts):
         try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                  "Chrome/120.0 Safari/537.36"
-                },
-            )
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
         except Exception as e:
-            last_err = e
-            if attempt < retries:
-                time.sleep(backoff ** attempt)
-            else:
-                raise
-    # Defensive (should not reach)
-    if last_err:
-        raise last_err
-    raise RuntimeError("http_get failed without exception")
+            last = e
+            # backoff
+            sleep_s = base_delay * (2 ** i) + (i * 0.1)
+            time.sleep(min(8.0, sleep_s))
+    raise RuntimeError(f"Failed to fetch {url}: {last}")
 
-
-class TextCollector(HTMLParser):
-    """
-    Minimal HTML text extractor; collects visible text in a flat list.
-    """
-    def __init__(self) -> None:
-        super().__init__()
-        self._texts: List[str] = []
-        self._skip: int = 0  # for skipping <script>, <style>
-
-    def handle_starttag(self, tag: str, attrs) -> None:
-        if tag in ("script", "style", "noscript"):
-            self._skip += 1
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in ("script", "style", "noscript") and self._skip > 0:
-            self._skip -= 1
-
-    def handle_data(self, data: str) -> None:
-        if self._skip:
-            return
-        s = data.strip()
-        if s:
-            self._texts.append(s)
-
-    def text(self) -> str:
-        return "\n".join(self._texts)
-
-
-def extract_entries(product: str, html_bytes: bytes, source_url: str) -> List[Dict[str, str]]:
-    """
-    Very tolerant parser:
-    - Scans the page text for 'items' by splitting on larger headings / empty lines
-    - Tries to extract KBs, a first-line title, and a nearby date.
-    """
-    parser = TextCollector()
+def parse_rss(xml_bytes: bytes) -> List[Dict[str, Any]]:
+    """Parse a simple RSS feed from Microsoft Update Catalog."""
+    items = []
+    # The feed is standard RSS 2.0
     try:
-        parser.feed(html_bytes.decode("utf-8", "replace"))
-    except Exception:
-        # Fallback decoding
-        parser.feed(html_bytes.decode(errors="replace"))
-    full_text = parser.text()
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return items
 
-    # Heuristic "blocks": split by double newlines (groups of text)
-    blocks = [b.strip() for b in re.split(r"\n{2,}", full_text) if b.strip()]
+    # Find all <item>
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        description = (item.findtext("description") or "").strip()
 
-    entries: List[Dict[str, str]] = []
-    for block in blocks:
-        kbs = sorted(set(KB_RE.findall(block)), key=str.lower)
-        if not kbs:
-            # If no KB in this block, skip it. We only list KB-bearing sections for report.
-            continue
+        items.append({
+            "title": title,
+            "link": link,
+            "pubDate": pub_date,
+            "description": description,
+        })
+    return items
 
-        # Title guess: first line (before dash/colon) or the first line itself
-        first_line = block.splitlines()[0].strip()
-        m = HEADLINE_RE.match(first_line)
-        title = m.group(1) if m else first_line
+KB_RE = re.compile(r"\bKB\d+\b", re.IGNORECASE)
 
-        # Date guess: first date-like substring found in this block
-        dm = DATE_RE.search(block)
-        date = dm.group(0) if dm else ""
+def extract_kbs(text: str) -> List[str]:
+    """Extract KB numbers from text."""
+    return sorted(set(m.group(0).upper() for m in KB_RE.finditer(text or "")))
 
-        entries.append(
-            {
-                "product": product,
-                "kbs": ", ".join(kbs),
-                "title": title,
-                "date": date,
-                "source": source_url,
-            }
-        )
-    return entries
-
-
-def build_rows() -> List[Dict[str, str]]:
-    all_rows: List[Dict[str, str]] = []
-    for product, url in URLS.items():
+def try_parse_date_rss(s: str) -> datetime:
+    """
+    Parse RFC822-ish dates from RSS.
+    Example: Tue, 05 Nov 2025 00:00:00 GMT
+    """
+    fmts = [
+        "%a, %d %b %Y %H:%M:%S %Z",
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%a, %d %b %Y %H:%M:%S +0000",
+        "%d %b %Y %H:%M:%S %Z",
+    ]
+    for f in fmts:
         try:
-            raw = http_get(url, retries=3)
-        except urllib.error.HTTPError as e:
-            print(f"⚠️  HTTP {e.code} fetching {url}", file=sys.stderr)
-            continue
+            return datetime.strptime(s, f).replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    # If unknown, return epoch so it likely filters out
+    return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+def html_escape(s: str) -> str:
+    return html.escape(s or "", quote=True)
+
+# -----------------------------
+# Core
+# -----------------------------
+
+def collect_updates() -> List[Dict[str, Any]]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS_BACK)
+    rows: List[Dict[str, Any]] = []
+
+    for product_name, feed_url, health_url in FEEDS:
+        try:
+            data = http_get(feed_url)
+            items = parse_rss(data)
         except Exception as e:
-            print(f"⚠️  Error fetching {url}: {e}", file=sys.stderr)
+            # If a feed fails, continue; we still want others
+            items = []
+
+        for it in items:
+            title = it["title"]
+            desc = it["description"]
+            link = it["link"]
+            dt = try_parse_date_rss(it["pubDate"])
+            if dt < cutoff:
+                continue
+
+            kbs = extract_kbs(title + " " + desc)
+            # Simple, readable description: prefer title; description can be verbose HTML
+            clean_desc = title
+            # Fallback to description if title is empty
+            if not clean_desc and desc:
+                clean_desc = re.sub("<[^>]+>", " ", desc)
+                clean_desc = re.sub(r"\s+", " ", clean_desc).strip()
+
+            rows.append({
+                "product": product_name,
+                "description": clean_desc,
+                "kbs": kbs or ["—"],
+                "date": dt,
+                "source": "Update Catalog RSS",
+                "source_link": link,
+                "health_link": health_url,
+            })
+
+    # Dedupe by (product, description, kb set)
+    seen = set()
+    unique = []
+    for r in rows:
+        key = (r["product"], r["description"], tuple(r["kbs"]))
+        if key in seen:
             continue
+        seen.add(key)
+        unique.append(r)
 
-        rows = extract_entries(product, raw, url)
-        all_rows.extend(rows)
+    # Sort: newest first
+    unique.sort(key=lambda r: r["date"], reverse=True)
+    return unique
 
-    # Deduplicate by (product, kbs, title, date)
-    dedup: Dict[Tuple[str, str, str, str], Dict[str, str]] = {}
-    for r in all_rows:
-        key = (r["product"], r["kbs"], r["title"], r["date"])
-        if key not in dedup:
-            dedup[key] = r
-    return list(dedup.values())
+def render_html(rows: List[Dict[str, Any]]) -> str:
+    count = len(rows)
+    gen_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+    def fmt_date(dt: datetime) -> str:
+        return dt.strftime("%b %d, %Y")
 
-# ===== 3) HTML RENDERING =====
+    # Simple, self-contained styles
+    css = """
+    :root{color-scheme:dark}
+    body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b1220;color:#e9eef7}
+    header{padding:28px 20px;border-bottom:1px solid #1b2743}
+    h1{margin:0 0 8px 0;font-size:22px}
+    .meta{opacity:.75;font-size:13px}
+    .wrap{max-width:1200px;margin:0 auto}
+    .controls{display:flex;gap:10px;margin:16px 0}
+    .btn{padding:8px 12px;border-radius:8px;background:#1a2a44;border:1px solid #243b63;color:#dfe8ff;text-decoration:none;font-size:13px}
+    .btn:hover{background:#21365b}
+    table{width:100%;border-collapse:collapse;margin:12px 0 40px 0}
+    th,td{padding:12px;border-bottom:1px solid #1b2743;vertical-align:top;font-size:14px}
+    th{opacity:.9;text-align:left}
+    .kb{display:inline-block;background:#0f2244;border:1px solid #25447a;color:#b8d1ff;border-radius:6px;padding:2px 8px;margin:2px 6px 2px 0;font-size:12px}
+    .pill{display:inline-block;background:#15253f;border:1px solid #25447a;color:#cfe0ff;border-radius:999px;padding:4px 10px;font-size:12px}
+    .src{display:inline-block;background:#0d1c33;border:1px solid #223b6e;color:#a9c5ff;border-radius:999px;padding:4px 10px;font-size:12px;text-decoration:none}
+    .src:hover{background:#12274d}
+    .known{display:inline-block;background:#38210a;border:1px solid #6a3c12;color:#ffd9a8;border-radius:999px;padding:4px 10px;font-size:12px;text-decoration:none}
+    .known:hover{background:#4a2b0f}
+    .muted{opacity:.7}
+    input[type="search"]{width:360px;background:#09132a;border:1px solid #20355e;border-radius:8px;padding:8px 10px;color:#e9eef7}
+    select{background:#09132a;border:1px solid #20355e;border-radius:8px;padding:8px 10px;color:#e9eef7}
+    """
 
-def html_page(rows: List[Dict[str, str]]) -> str:
-    rows_sorted = sorted(rows, key=lambda r: (r["date"] or "Z", r["product"], r["kbs"]), reverse=True)
+    # Minimal client-side filter by text
+    js = """
+    function filterRows(){
+      const q = document.getElementById('q').value.toLowerCase();
+      const rows = document.querySelectorAll('tbody tr');
+      rows.forEach(tr=>{
+        const t = tr.textContent.toLowerCase();
+        tr.style.display = (t.indexOf(q) !== -1) ? '' : 'none';
+      });
+    }
+    """
 
-    def esc(s: str) -> str:
-        return html.escape(s or "")
+    # Build rows
+    body_rows = []
+    for r in rows:
+        kb_html = " ".join(f'<span class="kb">{html_escape(kb)}</span>' for kb in r["kbs"])
+        body_rows.append(f"""
+        <tr>
+          <td>{html_escape(r["product"])}</td>
+          <td>{html_escape(r["description"])}</td>
+          <td>{kb_html or "—"}</td>
+          <td><a class="known" href="{html_escape(r["health_link"])}" target="_blank" rel="noopener">Release Health</a></td>
+          <td>{fmt_date(r["date"])}</td>
+          <td><a class="src" href="{html_escape(r["source_link"])}" target="_blank" rel="noopener">{html_escape(r["source"])}</a></td>
+        </tr>
+        """)
 
-    trs = []
-    for r in rows_sorted:
-        kbs = esc(r["kbs"])
-        prod = esc(r["product"])
-        title = esc(r["title"])
-        date = esc(r["date"])
-        src = esc(r["source"])
-        kb_display = kbs if kbs else "—"
-        title_display = title if title else "—"
-        date_display = date if date else "—"
-
-        # Make source clickable
-        source_html = f'<a href="{src}" target="_blank" rel="noopener">MS Support</a>'
-
-        trs.append(
-            f"<tr>"
-            f"<td>{prod}</td>"
-            f"<td>{kb_display}</td>"
-            f"<td>{title_display}</td>"
-            f"<td>{date_display}</td>"
-            f"<td>{source_html}</td>"
-            f"</tr>"
-        )
-
-    table_html = "\n".join(trs) if trs else (
-        "<tr><td colspan='5' style='text-align:center;color:#aaa;'>No updates found.</td></tr>"
-    )
-
-    return f"""<!doctype html>
+    html_out = f"""<!doctype html>
 <html lang="en">
-<head>
 <meta charset="utf-8">
-<title>Windows Updates (Last 30 Days)</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  body {{
-    background:#0f172a; color:#e2e8f0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial;
-    margin: 0; padding: 32px;
-  }}
-  h1 {{ margin: 0 0 16px 0; font-size: 22px; }}
-  .toolbar {{
-    display:flex; gap:8px; align-items:center; margin: 10px 0 24px 0; flex-wrap: wrap;
-  }}
-  table {{
-    width: 100%; border-collapse: collapse; background:#0b1220; border:1px solid #23304a;
-  }}
-  th, td {{ padding: 10px 12px; border-bottom: 1px solid #1e293b; vertical-align: top; }}
-  th {{ background:#0b162a; text-align:left; color:#aebbd3; font-weight:600; }}
-  a, a:visited {{ color:#7dd3fc; text-decoration: none; }}
-  a:hover {{ text-decoration: underline; }}
-  .muted {{ color:#94a3b8; font-size: 12px; margin-top: 6px; }}
-</style>
-</head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Windows Updates (Last {DAYS_BACK} Days)</title>
+<style>{css}</style>
 <body>
-  <h1>Windows Updates (Last 30 Days)</h1>
-  <div class="muted">Source: Microsoft Support “Update history” pages (stable topic URLs).</div>
-  <table>
-    <thead>
-      <tr>
-        <th>Product</th>
-        <th>KB(s)</th>
-        <th>Title</th>
-        <th>Release date</th>
-        <th>Source</th>
-      </tr>
-    </thead>
-    <tbody>
-      {table_html}
-    </tbody>
-  </table>
+  <header>
+    <div class="wrap">
+      <h1>Windows Updates (Last {DAYS_BACK} Days)</h1>
+      <div class="meta">Showing {count} updates • Generated {gen_ts}</div>
+      <div class="controls">
+        <input id="q" type="search" placeholder="Search CVE, KB, description, OS…" oninput="filterRows()">
+        <a class="btn" href="#" onclick="window.print();return false;">Print / PDF</a>
+      </div>
+    </div>
+  </header>
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>OS</th>
+          <th>Description</th>
+          <th>KB(s)</th>
+          <th>Known Issues</th>
+          <th>Release Date</th>
+          <th>Source</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(body_rows) if body_rows else '<tr><td colspan="6" class="muted">No updates in the selected window.</td></tr>'}
+      </tbody>
+    </table>
+    <div class="muted">Sources: Microsoft Update Catalog RSS; Windows Release Health landing pages.</div>
+  </div>
+<script>{js}</script>
 </body>
-</html>
-"""
+</html>"""
+    return html_out
 
-
-def main() -> int:
-    rows = build_rows()
-    html_out = html_page(rows)
-
-    out_path = os.path.join(os.getcwd(), "index.html")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html_out)
-
-    print(f"Collected {len(rows)} updates")
-    print(f"Wrote {out_path}")
-    return 0
-
+def main():
+    try:
+        rows = collect_updates()
+        html_text = render_html(rows)
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            f.write(html_text)
+        print(f"Wrote {len(rows)} updates to {OUTPUT_FILE}")
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
